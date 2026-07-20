@@ -97,7 +97,13 @@ enum class type_init_flags : uint32_t {
 
 // See internals.h
 struct nb_alias_chain;
+#if !defined(_Py_OPAQUE_PYOBJECT)
 struct nb_inst;
+#else
+// abi3t: the PyObject header is opaque; 'nb_inst' is an alias for PyObject and
+// its fields are reached via accessors (see nb_internals.h).
+using nb_inst = PyObject;
+#endif
 
 /// LIFO Instance pool
 struct nb_inst_pool {

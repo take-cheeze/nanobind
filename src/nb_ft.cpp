@@ -1,7 +1,10 @@
 #include <nanobind/nanobind.h>
 #include "nb_ft.h"
 
-#if defined(Py_GIL_DISABLED)
+#if defined(Py_GIL_DISABLED) && !defined(_Py_OPAQUE_PYOBJECT)
+// The abi3t (free-threaded stable ABI) build cannot touch opaque PyObject
+// fields; it forwards to libpython's exported helpers from nb_ft.h instead.
+
 /// Make an object immortal when targeting free-threaded Python
 void make_immortal(PyObject *op) noexcept {
     // See CPython's Objects/object.c

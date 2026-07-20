@@ -115,10 +115,8 @@ struct nb_inst_state {
 
 static_assert(sizeof(nb_inst_state) == sizeof(uint32_t));
 
-/// Python object representing an instance of a bound C++ type
-struct nb_inst { // usually: 24 bytes
-    PyObject_HEAD
-
+/// The two nanobind-managed fields carried by every bound-type instance.
+struct nb_inst_fields {
     /// Offset to the actual instance data
     int32_t offset;
 
@@ -126,13 +124,55 @@ struct nb_inst { // usually: 24 bytes
     nb_inst_state state;
 };
 
+#if !defined(_Py_OPAQUE_PYOBJECT)
+/// Python object representing an instance of a bound C++ type (usually 24 bytes)
+struct nb_inst {
+    PyObject_HEAD
+    int32_t offset;
+    nb_inst_state state;
+};
+
 static_assert(sizeof(nb_inst) == sizeof(PyObject) + sizeof(uint32_t) * 2);
+
+/// Access nanobind's per-instance fields (co-located after the PyObject header)
+NB_INLINE nb_inst_fields *nb_inst_fields_of(nb_inst *self) {
+    return (nb_inst_fields *) &self->offset;
+}
+
+/// Size of the co-located [header][offset][state] portion of an instance
+NB_INLINE size_t nb_inst_base_size() { return sizeof(nb_inst); }
+#else
+/* Free-threaded stable ABI ("abi3t"): the PyObject header is opaque, so
+   'nb_inst' is just an opaque PyObject and nanobind's per-instance fields live
+   in the type-data region reached via PyObject_GetTypeData(). The instance
+   layout is kept identical to the transparent build ([header][offset][state]
+   [payload...]); 'nb_inst_header_size' is the runtime size of the opaque header
+   (see nb_type.cpp), i.e. the compile-time-unknown 'sizeof(PyObject)'. */
+using nb_inst = PyObject;
+// Module-local cache of internals->inst_header_size (synced on module load) so
+// these hot-path accessors avoid an extra indirection.
+extern Py_ssize_t nb_inst_header_size;
+
+NB_INLINE nb_inst_fields *nb_inst_fields_of(nb_inst *self) {
+    return (nb_inst_fields *) ((char *) self + nb_inst_header_size);
+}
+
+NB_INLINE size_t nb_inst_base_size() {
+    return (size_t) nb_inst_header_size + sizeof(nb_inst_fields);
+}
+#endif
+
+/// Access the payload-offset field of an instance
+NB_INLINE int32_t &nb_inst_offset(nb_inst *self) { return nb_inst_fields_of(self)->offset; }
+
+/// Access the packed status word of an instance
+NB_INLINE nb_inst_state &nb_inst_status(nb_inst *self) { return nb_inst_fields_of(self)->state; }
 
 /// Helper to ensure that nb_inst instance state updates produce one 4-byte store
 inline void nb_inst_state_write(nb_inst *self, nb_inst_state state) noexcept {
     uint32_t w;
     std::memcpy(&w, &state, sizeof(w));
-    std::memcpy(&self->state, &w, sizeof(w));
+    std::memcpy(&nb_inst_status(self), &w, sizeof(w));
 }
 
 /// Dispatcher needed by an overload chain; chain merging takes the maximum
@@ -148,6 +188,7 @@ enum class call_complexity : uint8_t {
     complex = 2
 };
 
+#if !defined(_Py_OPAQUE_PYOBJECT)
 /// Python object representing a bound C++ function
 struct nb_func {
     PyObject_VAR_HEAD
@@ -170,6 +211,76 @@ struct nb_bound_method {
     nb_func *func;
     PyObject *self;
 };
+#else
+/* abi3t: the PyObject header is opaque, so 'nb_func', 'nb_ndarray' and
+   'nb_bound_method' are opaque PyObjects and their fields live in the type-data
+   region reached via PyObject_GetTypeData(). 'vectorcall' is kept first in each
+   field block so its Py_RELATIVE_OFFSET '__vectorcalloffset__' member resolves
+   to the type's tp_vectorcall_offset. Unlike the transparent build, nb_func is
+   not a variable-size (PyObject_VAR_HEAD) object: the limited API provides no
+   PyObject_GetItemData(), so the per-overload 'func_data' records live in a
+   separately allocated 'records' buffer instead of trailing items. */
+using nb_func = PyObject;
+using nb_ndarray = PyObject;
+using nb_bound_method = PyObject;
+
+struct nb_func_hdr {
+    PyObject* (*vectorcall)(PyObject *, PyObject * const*, size_t, PyObject *);
+    uint32_t max_nargs;
+    call_complexity complexity;
+    bool doc_uniform;
+    func_data *records;   // PyMem_Malloc'd array of 'size' overloads
+    uint32_t size;        // number of valid entries in 'records'
+};
+
+struct nb_ndarray_hdr {
+    ndarray_handle *th;
+};
+
+struct nb_bound_method_hdr {
+    PyObject* (*vectorcall)(PyObject *, PyObject * const*, size_t, PyObject *);
+    nb_func *func;
+    PyObject *self;
+};
+
+/// Reach an opaque object's field block (in its type-data region)
+template <typename T> NB_INLINE T *nb_opaque_fields(void *o) {
+    return (T *) PyObject_GetTypeData((PyObject *) o, Py_TYPE((PyObject *) o));
+}
+
+NB_INLINE func_data *nb_func_data(void *o) {
+    return nb_opaque_fields<nb_func_hdr>(o)->records;
+}
+#endif
+
+/* Uniform field accessors used at every member-access site. In a transparent
+   build the header is embedded, so these are a zero-cost pointer cast; under
+   abi3t they resolve the field block in the object's type-data region. Both
+   return types expose the same member names (vectorcall/func/self/th/...). */
+#if !defined(_Py_OPAQUE_PYOBJECT)
+NB_INLINE nb_func *nb_func_fields(void *o) { return (nb_func *) o; }
+NB_INLINE nb_bound_method *nb_bound_method_fields(void *o) { return (nb_bound_method *) o; }
+NB_INLINE nb_ndarray *nb_ndarray_fields(void *o) { return (nb_ndarray *) o; }
+#else
+NB_INLINE nb_func_hdr *nb_func_fields(void *o) { return nb_opaque_fields<nb_func_hdr>(o); }
+NB_INLINE nb_bound_method_hdr *nb_bound_method_fields(void *o) { return nb_opaque_fields<nb_bound_method_hdr>(o); }
+NB_INLINE nb_ndarray_hdr *nb_ndarray_fields(void *o) { return nb_opaque_fields<nb_ndarray_hdr>(o); }
+#endif
+
+/* Overload count of an 'nb_func'. In a transparent build the overloads are
+   trailing PyVarObject items (Py_SIZE); under abi3t they live in a separate
+   'records' buffer whose length is tracked explicitly. */
+#if !defined(_Py_OPAQUE_PYOBJECT)
+NB_INLINE size_t nb_func_size(void *o) { return (size_t) Py_SIZE((PyObject *) o); }
+NB_INLINE void nb_func_set_size(void *o, size_t n) {
+    ((PyVarObject *) o)->ob_size = (Py_ssize_t) n;
+}
+#else
+NB_INLINE size_t nb_func_size(void *o) { return nb_func_fields(o)->size; }
+NB_INLINE void nb_func_set_size(void *o, size_t n) {
+    nb_func_fields(o)->size = (uint32_t) n;
+}
+#endif
 
 /// Pointers require a good hash function to randomize the mapping to buckets
 struct ptr_hash {
@@ -517,6 +628,13 @@ struct nb_internals {
     ptrdiff_t type_data_offset;
 #endif
 
+#if defined(_Py_OPAQUE_PYOBJECT)
+    // abi3t: runtime size of the opaque PyObject header. Shared across all
+    // modules (like type_data_offset) so a module attaching to pre-existing
+    // internals sees the value computed by the module that created them.
+    Py_ssize_t inst_header_size;
+#endif
+
 #if defined(NB_FREE_THREADED)
     PyMutex mutex { };
 #endif
@@ -624,9 +742,11 @@ extern void nb_type_unregister(type_data *t) noexcept;
 extern PyObject *call_one_arg(PyObject *fn, PyObject *arg) noexcept;
 
 /// Fetch the nanobind function record from a 'nb_func' instance
+#if !defined(_Py_OPAQUE_PYOBJECT)
 NB_INLINE func_data *nb_func_data(void *o) {
     return (func_data *) (((char *) o) + sizeof(nb_func));
 }
+#endif
 
 /// Fetch the nanobind type record from a 'nb_type' instance
 NB_INLINE type_data *nb_type_data(PyTypeObject *o) noexcept{
@@ -644,8 +764,9 @@ NB_INLINE type_data *nb_type_data(PyTypeObject *o) noexcept{
 }
 
 inline void *inst_ptr(nb_inst *self) {
-    void *ptr = (void *) ((intptr_t) self + self->offset);
-    return self->state.direct ? ptr : *(void **) ptr;
+    nb_inst_fields *f = nb_inst_fields_of(self);
+    void *ptr = (void *) ((intptr_t) self + f->offset);
+    return f->state.direct ? ptr : *(void **) ptr;
 }
 
 // Return the instance pool associated with type `td`

@@ -178,7 +178,10 @@
 
 // Helper macros to ensure macro arguments are expanded before token pasting/stringification
 #define NB_MODULE_IMPL(name, variable) NB_MODULE_IMPL2(name, variable)
-#define NB_MODULE_IMPL2(name, variable)                                        \
+
+// Shared 'exec' phase used by both the PyModuleDef and the abi3t export-slot
+// module definitions below.
+#define NB_MODULE_EXEC(name)                                                   \
     static void nanobind_##name##_exec_impl(nanobind::module_);                \
     static int nanobind_##name##_exec(PyObject *m) {                           \
         nanobind::detail::nb_module_exec(NB_DOMAIN_STR, m);                    \
@@ -195,7 +198,11 @@
             PyErr_SetString(PyExc_ImportError, e.what());                      \
         }                                                                      \
         return -1;                                                             \
-    }                                                                          \
+    }
+
+#if !defined(_Py_OPAQUE_PYOBJECT)
+#define NB_MODULE_IMPL2(name, variable)                                        \
+    NB_MODULE_EXEC(name)                                                       \
     static PyModuleDef_Slot nanobind_##name##_slots[] = {                      \
         { Py_mod_exec, (void *) nanobind_##name##_exec },                      \
         NB_MODULE_SLOTS_2                                                      \
@@ -210,5 +217,36 @@
         return PyModuleDef_Init(&nanobind_##name##_module);                    \
     }                                                                          \
     void nanobind_##name##_exec_impl(nanobind::module_ variable)
+#else
+// abi3t (PEP 803): 'PyModuleDef' is opaque under the limited API, so the module
+// is defined via export slots returned from a 'PyModExport_<name>' entry point
+// instead of a statically initialized 'PyModuleDef' + 'PyInit_<name>'. The
+// four-field brace initializers avoid designated initializers (C++20) and
+// '-Wmissing-field-initializers'; see <slots.h> for the 'PySlot' layout.
+#define NB_SLOT_DATA_(id, val)                                                  \
+    { (id), PySlot_INTPTR | PySlot_STATIC, {0}, {(void *) (val)} }
+#define NB_SLOT_SENTINEL_(id, val)                                             \
+    { (id), PySlot_INTPTR, {0}, {(void *) (val)} }
+#define NB_SLOT_FUNC_(id, val)                                                 \
+    { (id), 0, {0}, {(void *) (_Py_funcptr_t) (val)} }
+#define NB_MODULE_IMPL2(name, variable)                                        \
+    NB_MODULE_EXEC(name)                                                       \
+    PyABIInfo_VAR(nanobind_##name##_abi_info);                                 \
+    static PySlot nanobind_##name##_export_slots[] = {                         \
+        NB_SLOT_DATA_(Py_mod_abi, &nanobind_##name##_abi_info),                \
+        NB_SLOT_DATA_(Py_mod_name, #name),                                     \
+        NB_SLOT_SENTINEL_(Py_mod_gil, Py_MOD_GIL_NOT_USED),                    \
+        NB_SLOT_SENTINEL_(Py_mod_multiple_interpreters,                        \
+                          Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED),         \
+        NB_SLOT_FUNC_(Py_mod_exec, nanobind_##name##_exec),                    \
+        NB_SLOT_FUNC_(Py_mod_state_free, nanobind::detail::nb_module_free),    \
+        { 0, 0, {0}, {nullptr} }                                              \
+    };                                                                         \
+    extern "C" [[maybe_unused]] NB_EXPORT PySlot *PyModExport_##name(void);    \
+    extern "C" PySlot *PyModExport_##name(void) {                              \
+        return nanobind_##name##_export_slots;                                 \
+    }                                                                          \
+    void nanobind_##name##_exec_impl(nanobind::module_ variable)
+#endif
 
 #define NB_MODULE(name, variable) NB_MODULE_IMPL(name, variable)
