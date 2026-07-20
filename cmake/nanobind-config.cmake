@@ -90,10 +90,16 @@ if(NOT DEFINED NB_SUFFIX OR NOT DEFINED NB_SUFFIX_S)
   endif()
 endif()
 
-# Derive the free-threaded stable ABI suffix (PEP 803 "abi3t", CPython >= 3.15)
-# from the abi3 suffix by tagging it with a trailing 't'.
+# Derive the free-threaded stable ABI suffix (PEP 803 "abi3t", CPython >= 3.15).
+# On a free-threaded interpreter the stable-ABI suffix (NB_SUFFIX_S) is already
+# ".abi3t.so", so use it as-is; on a GIL interpreter it is ".abi3.so", which is
+# tagged with a trailing 't".
 if(NOT DEFINED NB_SUFFIX_ST)
-  string(REPLACE "abi3" "abi3t" NB_SUFFIX_ST "${NB_SUFFIX_S}")
+  if(NB_SUFFIX_S MATCHES "abi3t")
+    set(NB_SUFFIX_ST "${NB_SUFFIX_S}")
+  else()
+    string(REPLACE "abi3" "abi3t" NB_SUFFIX_ST "${NB_SUFFIX_S}")
+  endif()
 endif()
 
 # Stash these for later use

@@ -22,6 +22,21 @@
 #include <frameobject.h>
 #include <pythread.h>
 
+#if defined(_Py_OPAQUE_PYOBJECT)
+/* Free-threaded stable ABI ("abi3t", PEP 803): the limited API excludes
+   <cpython/pylock.h>, so ``PyMutex`` is undeclared. It is nonetheless a
+   documented, statically zero-initializable one-byte object whose lock/unlock
+   routines are exported from libpython. Declare them ourselves so nanobind can
+   keep embedding ``PyMutex`` by value (in ``ft_mutex``, ``nb_shard`` and
+   ``nb_internals``). The inline uncontended fast path from pylock.h is
+   unavailable here, so every call goes through the exported functions. */
+extern "C" {
+    typedef struct PyMutex { uint8_t _bits; } PyMutex;
+    PyAPI_FUNC(void) PyMutex_Lock(PyMutex *m);
+    PyAPI_FUNC(void) PyMutex_Unlock(PyMutex *m);
+}
+#endif
+
 /* Python #defines overrides on all sorts of core functions, which
    tends to weak havok in C++ codebases that expect these to work
    like regular functions (potentially with several overloads) */

@@ -55,9 +55,25 @@ static PyType_Spec nb_meta_spec = {
     /* .slots = */ nb_meta_slots
 };
 
+/* Under abi3t the field blocks live in a relative type-data region, so member
+   offsets use Py_RELATIVE_OFFSET (into the '*_hdr' structs, resolved to absolute
+   at type creation) and basicsize is negative; in a transparent build they are
+   plain offsets/sizes of the header-embedding structs. */
+#if !defined(_Py_OPAQUE_PYOBJECT)
+#  define NB_MEMBER_OFF(structt, hdr, field) \
+      ((Py_ssize_t) offsetof(structt, field)), READONLY
+#  define NB_BASICSIZE(structt, hdr) ((int) sizeof(structt))
+#  define NB_FUNC_ITEMSIZE ((int) sizeof(func_data))
+#else
+#  define NB_MEMBER_OFF(structt, hdr, field) \
+      ((Py_ssize_t) offsetof(hdr, field)), (Py_READONLY | Py_RELATIVE_OFFSET)
+#  define NB_BASICSIZE(structt, hdr) (-(int) sizeof(hdr))
+#  define NB_FUNC_ITEMSIZE 0
+#endif
+
 static PyMemberDef nb_func_members[] = {
     { "__vectorcalloffset__", T_PYSSIZET,
-      (Py_ssize_t) offsetof(nb_func, vectorcall), READONLY, nullptr },
+      NB_MEMBER_OFF(nb_func, nb_func_hdr, vectorcall), nullptr },
     { nullptr, 0, 0, 0, nullptr }
 };
 
@@ -81,8 +97,8 @@ static PyType_Slot nb_func_slots[] = {
 
 static PyType_Spec nb_func_spec = {
     /* .name = */ "nanobind.nb_func",
-    /* .basicsize = */ (int) sizeof(nb_func),
-    /* .itemsize = */ (int) sizeof(func_data),
+    /* .basicsize = */ NB_BASICSIZE(nb_func, nb_func_hdr),
+    /* .itemsize = */ NB_FUNC_ITEMSIZE,
     /* .flags = */ Py_TPFLAGS_DEFAULT |
                    Py_TPFLAGS_HAVE_GC |
                    Py_TPFLAGS_HAVE_VECTORCALL |
@@ -105,8 +121,8 @@ static PyType_Slot nb_method_slots[] = {
 
 static PyType_Spec nb_method_spec = {
     /*.name = */ "nanobind.nb_method",
-    /*.basicsize = */ (int) sizeof(nb_func),
-    /*.itemsize = */ (int) sizeof(func_data),
+    /*.basicsize = */ NB_BASICSIZE(nb_func, nb_func_hdr),
+    /*.itemsize = */ NB_FUNC_ITEMSIZE,
     /*.flags = */ Py_TPFLAGS_DEFAULT |
                   Py_TPFLAGS_HAVE_GC |
                   Py_TPFLAGS_METHOD_DESCRIPTOR |
@@ -117,11 +133,11 @@ static PyType_Spec nb_method_spec = {
 
 static PyMemberDef nb_bound_method_members[] = {
     { "__vectorcalloffset__", T_PYSSIZET,
-      (Py_ssize_t) offsetof(nb_bound_method, vectorcall), READONLY, nullptr },
+      NB_MEMBER_OFF(nb_bound_method, nb_bound_method_hdr, vectorcall), nullptr },
     { "__func__", T_OBJECT_EX,
-      (Py_ssize_t) offsetof(nb_bound_method, func), READONLY, nullptr },
+      NB_MEMBER_OFF(nb_bound_method, nb_bound_method_hdr, func), nullptr },
     { "__self__", T_OBJECT_EX,
-      (Py_ssize_t) offsetof(nb_bound_method, self), READONLY, nullptr },
+      NB_MEMBER_OFF(nb_bound_method, nb_bound_method_hdr, self), nullptr },
     { nullptr, 0, 0, 0, nullptr }
 };
 
@@ -137,7 +153,7 @@ static PyType_Slot nb_bound_method_slots[] = {
 
 static PyType_Spec nb_bound_method_spec = {
     /* .name = */ "nanobind.nb_bound_method",
-    /* .basicsize = */ (int) sizeof(nb_bound_method),
+    /* .basicsize = */ NB_BASICSIZE(nb_bound_method, nb_bound_method_hdr),
     /* .itemsize = */ 0,
     /* .flags = */ Py_TPFLAGS_DEFAULT |
                    Py_TPFLAGS_HAVE_GC |
@@ -170,6 +186,12 @@ void default_exception_translator(const std::exception_ptr &p, void *) {
 
 // Initialized once when the module is loaded, no locking needed
 nb_internals *internals = nullptr;
+
+#if defined(_Py_OPAQUE_PYOBJECT)
+// abi3t: runtime size of the opaque PyObject header (see nb_internals.h). Set
+// during init_internals() before any bound instance type is created.
+Py_ssize_t nb_inst_header_size = 0;
+#endif
 
 #if defined(NB_FREE_THREADED)
 NB_THREAD_LOCAL nb_thread_state *nb_thread_state_tls = nullptr;
@@ -316,6 +338,40 @@ static void init_internals(nb_internals *p) {
     p->type_data_offset =
         ((uint8_t *) PyObject_GetTypeData(dummy, nb_meta) - (uint8_t *) dummy);
     Py_DECREF(dummy);
+#endif
+
+#if defined(_Py_OPAQUE_PYOBJECT)
+    // abi3t: the PyObject header is opaque, so determine its size once. A plain
+    // 'object' subclass with 1 byte of relative type-data reports, via
+    // PyObject_GetTypeData(), where a subclass' extra storage begins -- i.e. the
+    // header size. nanobind lays out bound instances as [header][offset][state]
+    // [payload...], placing its fields at this offset (see nb_internals.h).
+    {
+        PyType_Slot inst_probe_slots[] = {
+            { Py_tp_new, (void *) PyType_GenericNew },
+            { 0, nullptr }
+        };
+        PyType_Spec inst_probe_spec = {
+            /* .name = */ "nanobind.dummy_inst",
+            /* .basicsize = */ -1,
+            /* .itemsize = */ 0,
+            /* .flags = */ Py_TPFLAGS_DEFAULT,
+            /* .slots = */ inst_probe_slots
+        };
+        PyObject *pt = PyType_FromMetaclass(nullptr, p->nb_module,
+                                            &inst_probe_spec, nullptr);
+        check(pt, "nanobind::detail::nb_module_exec(): instance header-size "
+                  "probe type creation failed!");
+        PyObject *po = PyType_GenericAlloc((PyTypeObject *) pt, 0);
+        check(po, "nanobind::detail::nb_module_exec(): instance header-size "
+                  "probe allocation failed!");
+        nb_inst_header_size =
+            (uint8_t *) PyObject_GetTypeData(po, (PyTypeObject *) pt) -
+            (uint8_t *) po;
+        p->inst_header_size = nb_inst_header_size;
+        Py_DECREF(po);
+        Py_DECREF(pt);
+    }
 #endif
 
     // Create the single metaclass shared by all bound types. This may
@@ -547,6 +603,11 @@ NB_NOINLINE void nb_module_exec(const char *name, PyObject *) {
         check(internals, "nanobind::detail::nb_module_exec(): "
                          "capsule pointer is NULL!");
         is_alive_ptr = internals->is_alive_ptr;
+#if defined(_Py_OPAQUE_PYOBJECT)
+        // abi3t: adopt the header size computed by the module that created the
+        // shared internals (this module's init_internals() will return early).
+        nb_inst_header_size = internals->inst_header_size;
+#endif
 
         init_internals(internals);
         init_pyobjects(internals);

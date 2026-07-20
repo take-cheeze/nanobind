@@ -142,7 +142,7 @@ struct ndarray_handle {
 
 static void nb_ndarray_dealloc(PyObject *self) {
     PyTypeObject *tp = Py_TYPE(self);
-    ndarray_dec_ref(((nb_ndarray *) self)->th);
+    ndarray_dec_ref(nb_ndarray_fields(self)->th);
     PyObject_Free(self);
     Py_DECREF(tp);
 }
@@ -152,7 +152,7 @@ static int nb_ndarray_getbuffer(PyObject *self, Py_buffer *view, int flags) {
     // the exporter signals failure by returning -1.
     view->obj = nullptr;
 
-    ndarray_handle *th = ((nb_ndarray *) self)->th;
+    ndarray_handle *th = nb_ndarray_fields(self)->th;
     dlpack::dltensor &t = th->tensor();
 
     if (t.device.device_type != device::cpu::value) {
@@ -297,7 +297,7 @@ static PyObject *nb_ndarray_dlpack(PyObject *self, PyObject *const *args,
         return key == r || PyObject_RichCompareBool(key, r, Py_EQ) == 1;
     };
 
-    ndarray_handle *th = ((nb_ndarray *) self)->th;
+    ndarray_handle *th = nb_ndarray_fields(self)->th;
     dlpack::dltensor &t = th->tensor();
 
     long max_major_version = 0;
@@ -385,7 +385,7 @@ static PyObject *nb_ndarray_dlpack(PyObject *self, PyObject *const *args,
 
 // This function implements __dlpack_device__() for a nanobind.nb_ndarray.
 static PyObject *nb_ndarray_dlpack_device(PyObject *self, PyObject *) {
-    ndarray_handle *th = ((nb_ndarray *) self)->th;
+    ndarray_handle *th = nb_ndarray_fields(self)->th;
     dlpack::dltensor& t = th->tensor();
     PyObject *r;
     if (t.device.device_type == 1 && t.device.device_id == 0) {
@@ -433,7 +433,11 @@ static PyTypeObject *nb_ndarray_tp(nb_internals *internals_) noexcept {
 
         PyType_Spec spec = {
             /* .name = */ "nanobind.nb_ndarray",
+#if !defined(_Py_OPAQUE_PYOBJECT)
             /* .basicsize = */ (int) sizeof(nb_ndarray),
+#else
+            /* .basicsize = */ -(int) sizeof(nb_ndarray_hdr),
+#endif
             /* .itemsize = */ 0,
             /* .flags = */ Py_TPFLAGS_DEFAULT,
             /* .slots = */ slots
@@ -1250,7 +1254,7 @@ PyObject *ndarray_export(ndarray_handle *th, int framework,
         nb_ndarray *h = PyObject_New(nb_ndarray, nb_ndarray_tp(internals_));
         if (!h)
             return nullptr;
-        h->th = th;
+        nb_ndarray_fields(h)->th = th;
         ndarray_inc_ref(th);
         o = steal((PyObject *) h);
     }
